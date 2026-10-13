@@ -8,7 +8,7 @@ import { readFileSync } from "fs";
 import { createAccount, createClient } from "genlayer-js";
 import { testnetBradbury } from "genlayer-js/chains";
 
-const CONTRACT = process.env.CANARY || "0x80C94f43183b2342101bbd8ed4038184a33759D5";
+const CONTRACT = process.env.CANARY || "0x5e0E239E12B82d8376C9D4D3Bd5af8ab7E805e85";
 const WALLETS = JSON.parse(readFileSync("C:/Users/olumi/.genlayer-test-wallets/wallets.json", "utf8"));
 const client = createClient({ chain: testnetBradbury, account: createAccount(WALLETS["gl-test-1"].privateKey) });
 
@@ -51,6 +51,7 @@ if (cmd === "id") {
   console.log("id:", id);
 } else if (cmd === "check") {
   await write("check", [a[0]]);
+  await new Promise((r) => setTimeout(r, 15000)); // let the new state propagate before reading
   console.log(j(await read("get_canary", [a[0]])));
 } else if (cmd === "show") {
   console.log(j(await read("get_canary", [a[0]])));

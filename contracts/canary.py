@@ -13,6 +13,7 @@ MAX_WINDOW = 2000
 MIN_AGE_DAYS = 1
 MAX_AGE_DAYS = 400
 MAX_URL_LENGTH = 300
+MAX_PAGE_SIZE = 50  # most ids one get_ids() call returns
 MAX_HTML_BYTES = 2_000_000
 MAX_OCCURRENCES = 20
 MIN_CHECK_INTERVAL = 300  # seconds between checks of one canary
@@ -71,7 +72,7 @@ def _clean_url(url) -> str:
     _bad(not url.startswith("https://"), "url must start with https://")
     _bad(len(url) > MAX_URL_LENGTH, f"url must be at most {MAX_URL_LENGTH} characters")
     for ch in url:
-        _bad(ch.isspace() or ch in "\"'<>\\`", "url contains a forbidden character")
+        _bad(ch.isspace() or ch in "\"'<>\\`|", "url contains a forbidden character")
     rest = url[8:]
     host = rest.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0].lower()
     _bad("@" in host, "url may not contain credentials")
@@ -103,7 +104,10 @@ def _key(url: str, phrase: str, max_age_days: int, window: int) -> str:
     """One canary is one (page, statement, freshness rule). Because the id is
     derived from all of them, nobody can squat the id of someone else's
     canary with a different rule, and registering the same canary twice is
-    simply refused."""
+    simply refused. The fields are joined with "|", which a URL may not
+    contain, so a key reads back as exactly one tuple: the URL is everything
+    before the first "|", the window and age are the last two fields, and the
+    statement (which may itself contain "|") is what is left in between."""
     return f"{url}|{phrase}|{max_age_days}|{window}"
 
 
@@ -376,20 +380,30 @@ class Canary(gl.Contract):
 
     @gl.public.view
     def is_alive(self, canary_id: str, max_check_age_seconds: int) -> bool:
-        """True only if the last check found the canary alive AND that check
-        is recent enough. Never reverts: an unknown id, a bad argument, an
-        unchecked or stale-checked canary all answer False."""
+        """True only if the last check found the canary alive, that check is
+        recent enough, AND the statement's date is still within max_age_days
+        as of right now. The last condition matters: a date that was 35 days
+        old at check time is 36 days old tomorrow, and a consumer that
+        tolerates week-old checks must not be told it is fresh. Never
+        reverts: an unknown id, a bad argument, an unchecked or stale-checked
+        canary all answer False."""
         if not isinstance(canary_id, str) or canary_id not in self.canaries:
             return False
         if isinstance(max_check_age_seconds, bool) or not isinstance(max_check_age_seconds, int) or max_check_age_seconds < 0:
             return False
         w = self.canaries[canary_id]
-        if w.status != ALIVE:
+        if w.status != ALIVE or w.last_date == "":
             return False
-        return self._now() - int(w.checked_at) <= max_check_age_seconds
+        now = self._now()
+        if now - int(w.checked_at) > max_check_age_seconds:
+            return False
+        today = datetime.fromtimestamp(now, timezone.utc).date()
+        return (today - date.fromisoformat(w.last_date)).days <= int(w.max_age_days)
 
     @gl.public.view
     def status_of(self, canary_id: str) -> str:
+        """The status as of the last check. It does not age by itself; use
+        is_alive() to gate on freshness."""
         if not isinstance(canary_id, str) or canary_id not in self.canaries:
             return "unknown"
         return self.canaries[canary_id].status
@@ -424,5 +438,17 @@ class Canary(gl.Contract):
         return [{"at": int(events[i].at), "status": events[i].status, "date": events[i].date} for i in order]
 
     @gl.public.view
-    def get_all_ids(self) -> list:
-        return list(self.canary_ids)
+    def get_count(self) -> int:
+        return len(self.canary_ids)
+
+    @gl.public.view
+    def get_ids(self, offset: int, limit: int) -> list:
+        """A page of registered ids, oldest first, at most MAX_PAGE_SIZE.
+        Anyone can register, so the list is unbounded and is never returned
+        whole. Never reverts: a bad argument answers with an empty page."""
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            return []
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            return []
+        end = min(offset + min(limit, MAX_PAGE_SIZE), len(self.canary_ids))
+        return [self.canary_ids[i] for i in range(offset, end)]

@@ -68,7 +68,8 @@ def test_register_stores_the_canary(direct_vm, direct_deploy, direct_alice):
     c = contract.get_canary(cid)
     assert c["url"] == URL and c["phrase"] == PHRASE
     assert (c["max_age_days"], c["window"], c["status"], c["checks"]) == (AGE, WINDOW, "unchecked", 0)
-    assert contract.get_all_ids() == [cid]
+    assert contract.get_ids(0, 10) == [cid]
+    assert contract.get_count() == 1
     assert contract.status_of(cid) == "unchecked"
 
 
@@ -97,6 +98,59 @@ def test_nobody_can_squat_another_canarys_id(direct_vm, direct_deploy, direct_al
     assert a != b
 
 
+def test_an_id_cannot_be_forged_with_a_pipe_in_the_url(direct_vm, direct_deploy, direct_alice, direct_bob):
+    """The id is url|phrase|age|window. If a URL could contain "|", an attacker
+    could register a different page whose id equals the victim's, blocking the
+    victim and pointing every consumer at the attacker's page."""
+    contract = direct_deploy(CONTRACT)
+    direct_vm.warp(T0)
+    victim = _register(contract, direct_vm, direct_alice, url="https://a.com/p", phrase="alpha beta|gamma delta")
+    direct_vm.sender = direct_bob
+    with direct_vm.expect_revert("forbidden"):
+        contract.register("https://a.com/p|alpha beta", "gamma delta", AGE, WINDOW)
+    # the victim's canary is untouched and still points at their page
+    assert contract.get_canary(victim)["url"] == "https://a.com/p"
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    ["alpha beta", "alpha beta|30", "alpha|beta|gamma delta", "|||x y z w v u", "a b c d e f g|40|400"],
+)
+def test_every_id_reads_back_as_exactly_one_tuple(direct_vm, direct_deploy, direct_alice, phrase):
+    """Phrases may contain "|"; the key must still decode to one tuple, so two
+    different canaries can never share an id."""
+    contract = direct_deploy(CONTRACT)
+    key = contract.canary_id(URL, phrase, 40, 400)
+    head, rest = key.split("|", 1)
+    mid, age, window = rest.rsplit("|", 2)
+    assert (head, mid, int(age), int(window)) == (URL, _mod(contract)._norm(phrase), 40, 400)
+
+
+def test_listing_is_paged_and_bounded(direct_vm, direct_deploy, direct_alice):
+    contract = direct_deploy(CONTRACT)
+    direct_vm.warp(T0)
+    direct_vm.sender = direct_alice
+    n = _mod(contract).MAX_PAGE_SIZE + 7
+    ids = []
+    for i in range(n):
+        contract.register(f"https://site{i}.example.com/c", PHRASE, AGE, WINDOW)
+        ids.append(contract.canary_id(f"https://site{i}.example.com/c", PHRASE, AGE, WINDOW))
+    assert contract.get_count() == n
+    assert contract.get_ids(0, 10) == ids[:10]
+    assert contract.get_ids(10, 5) == ids[10:15]
+    assert contract.get_ids(0, 10**6) == ids[: _mod(contract).MAX_PAGE_SIZE]  # capped, not unbounded
+    assert contract.get_ids(n - 3, 50) == ids[n - 3:]
+    assert contract.get_ids(n, 5) == []
+
+
+def test_listing_never_reverts_on_bad_arguments(direct_vm, direct_deploy, direct_alice):
+    contract, _ = _setup(direct_vm, direct_deploy, direct_alice)
+    _register(contract, direct_vm, direct_alice, url="https://second.example.com/c")  # two ids, so offset True (1) would not be empty by accident
+    assert len(contract.get_ids(0, 10)) == 2
+    for off, lim in ((-1, 5), (0, 0), (0, -3), (True, 5), (0, True), ("0", 5), (0, "5"), (None, 5), (0, None)):
+        assert contract.get_ids(off, lim) == [], (off, lim)
+
+
 def test_registering_twice_is_refused(direct_vm, direct_deploy, direct_alice, direct_bob):
     contract, _ = _setup(direct_vm, direct_deploy, direct_alice)
     direct_vm.sender = direct_bob
@@ -123,6 +177,7 @@ def test_registering_twice_is_refused(direct_vm, direct_deploy, direct_alice, di
         ("https://-bad.example.com/c", "invalid"),
         ("https://exa mple.com/c", "forbidden"),
         ("https://example.com/<x>", "forbidden"),
+        ("https://example.com/a|b", "forbidden"),  # "|" separates the fields of the id
         ("https://" + "a" * 64 + ".com/c", "invalid"),
         ("https://example.com/" + "p" * 300, "at most"),
     ],
@@ -480,6 +535,20 @@ def test_is_alive_needs_a_recent_check(direct_vm, direct_deploy, direct_alice):
     direct_vm.warp("2026-10-13T13:00:01Z")
     assert contract.is_alive(cid, 3600) is False  # the check itself has gone stale
     assert contract.is_alive(cid, 7200) is True
+
+
+def test_is_alive_notices_a_statement_ageing_out_after_the_check(direct_vm, direct_deploy, direct_alice):
+    """alive at check time is not alive forever: the date keeps getting older,
+    and a consumer that tolerates old checks must still not be told it is fresh."""
+    contract, cid = _setup(direct_vm, direct_deploy, direct_alice)
+    _check(contract, direct_vm, cid, body=_page("2026-09-08"))  # exactly 35 days old, the limit
+    assert contract.status_of(cid) == "alive"
+    assert contract.is_alive(cid, 10**9) is True
+    direct_vm.warp("2026-10-13T23:59:59Z")  # same UTC day: the date is still 35 days old
+    assert contract.is_alive(cid, 10**9) is True
+    direct_vm.warp("2026-10-14T00:00:00Z")  # midnight: it is now 36 days old
+    assert contract.is_alive(cid, 10**9) is False  # the check is recent enough, the statement is not
+    assert contract.status_of(cid) == "alive"  # the stored status is only as of the check
 
 
 def test_is_alive_is_false_before_any_check(direct_vm, direct_deploy, direct_alice):
