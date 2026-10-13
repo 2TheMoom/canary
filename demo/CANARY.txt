@@ -2,5 +2,5 @@ Canary demo statement
 
 This page is a demo canary for the Canary contract. Nothing here is a real legal statement.
 
-ExampleOrg has not received any gag orders.
+ExampleOrg can no longer comment on legal requests.
 Signed: 2026-10-13
